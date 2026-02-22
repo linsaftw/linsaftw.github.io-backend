@@ -66,16 +66,15 @@ app.post('/api/auth/register',
       }
 
       const hash = await bcrypt.hash(password, 12);
-      const result = await query(
-        'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+      await query(
+        'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, "user")',
         [username, email, hash]
       );
 
-      const userId = result.insertId;
-      await createSession(res, userId);
-
+      // NOTE: Registration does NOT create a session or log the user in.
+      // Registered users have role "user" and cannot access admin.
       console.log(`[register] New user: ${username} <${email}>`);
-      return res.status(201).json({ message: 'Registered successfully.' });
+      return res.status(201).json({ message: 'Registered successfully. You can now log in.' });
     } catch (err) {
       console.error('[register]', err.message);
       return res.status(500).json({ error: 'Server error.' });
@@ -107,7 +106,7 @@ app.post('/api/auth/login',
       }
 
       await createSession(res, user.id);
-      console.log(`[login] ${user.username}`);
+      console.log(`[login] ${user.username} (role: ${user.role})`);
       return res.json({ message: 'Logged in.', user: { id: user.id, username: user.username, role: user.role } });
     } catch (err) {
       console.error('[login]', err.message);
@@ -128,18 +127,19 @@ app.get('/api/auth/me', (req, res) => {
   return res.json({ user: req.user });
 });
 
-// ===== POST ROUTES =====
+// ===== PUBLIC POST ROUTES =====
 
-// GET /api/posts
+// GET /api/posts — public only; admins can pass ?visibility=all
 app.get('/api/posts', async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = 20;
     const offset = (page - 1) * limit;
 
+    // Only admins can see all posts (including private)
     let visibilityFilter = "visibility = 'public'";
-    if (req.user && (req.query.visibility === 'all')) {
-      visibilityFilter = '1=1'; // Show all to logged in users
+    if (req.user && req.user.role === 'admin' && req.query.visibility === 'all') {
+      visibilityFilter = '1=1';
     }
 
     const posts = await query(
@@ -157,18 +157,19 @@ app.get('/api/posts', async (req, res) => {
   }
 });
 
-// GET /api/posts/:id
+// GET /api/posts/:id — public posts open; private posts admin-only
 app.get('/api/posts/:id', async (req, res) => {
   try {
     const post = await queryOne('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found.' });
 
-    // Private posts only visible to authenticated users
-    if (post.visibility === 'private' && !req.user) {
-      return res.status(403).json({ error: 'Access denied.' });
+    // Private posts: only admins can view
+    if (post.visibility === 'private') {
+      if (!req.user || req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Access denied.' });
+      }
     }
 
-    // Fetch edit history
     const edits = await query(
       'SELECT pe.*, u.username as editor_username FROM post_edits pe LEFT JOIN users u ON u.id = pe.editor_id WHERE pe.post_id = ? ORDER BY pe.edited_at DESC',
       [post.id]
@@ -181,8 +182,10 @@ app.get('/api/posts/:id', async (req, res) => {
   }
 });
 
-// POST /api/posts (create)
-app.post('/api/posts', requireAuth, async (req, res) => {
+// ===== ADMIN-ONLY POST WRITE ROUTES =====
+
+// POST /api/posts (create) — admin only
+app.post('/api/posts', requireAdmin, async (req, res) => {
   try {
     const { title, caption, image_path, content_markdown, visibility } = req.body;
     if (!title || !content_markdown) {
@@ -203,20 +206,14 @@ app.post('/api/posts', requireAuth, async (req, res) => {
   }
 });
 
-// PUT /api/posts/:id (update)
-app.put('/api/posts/:id', requireAuth, async (req, res) => {
+// PUT /api/posts/:id (update) — admin only
+app.put('/api/posts/:id', requireAdmin, async (req, res) => {
   try {
     const post = await queryOne('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found.' });
 
-    // Only author or admin can edit
-    if (post.author_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
-    }
-
     const { title, caption, image_path, content_markdown, visibility, edit_message } = req.body;
 
-    // Save edit history
     await query(
       'INSERT INTO post_edits (post_id, editor_id, old_content, new_content, old_title, new_title, edit_message) VALUES (?, ?, ?, ?, ?, ?, ?)',
       [post.id, req.user.id, post.content_markdown, content_markdown, post.title, title, edit_message || null]
@@ -236,15 +233,11 @@ app.put('/api/posts/:id', requireAuth, async (req, res) => {
   }
 });
 
-// DELETE /api/posts/:id
-app.delete('/api/posts/:id', requireAuth, async (req, res) => {
+// DELETE /api/posts/:id — admin only
+app.delete('/api/posts/:id', requireAdmin, async (req, res) => {
   try {
     const post = await queryOne('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found.' });
-
-    if (post.author_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
-    }
 
     await query('DELETE FROM posts WHERE id = ?', [post.id]);
     console.log(`[post delete] id=${post.id} by ${req.user.username}`);
@@ -255,15 +248,11 @@ app.delete('/api/posts/:id', requireAuth, async (req, res) => {
   }
 });
 
-// PATCH /api/posts/:id/visibility
-app.patch('/api/posts/:id/visibility', requireAuth, async (req, res) => {
+// PATCH /api/posts/:id/visibility — admin only
+app.patch('/api/posts/:id/visibility', requireAdmin, async (req, res) => {
   try {
     const post = await queryOne('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found.' });
-
-    if (post.author_id !== req.user.id && req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Forbidden.' });
-    }
 
     const vis = req.body.visibility === 'private' ? 'private' : 'public';
     await query('UPDATE posts SET visibility=? WHERE id=?', [vis, post.id]);
@@ -276,7 +265,7 @@ app.patch('/api/posts/:id/visibility', requireAuth, async (req, res) => {
 
 // ===== ADMIN ROUTES =====
 
-// GET /api/admin/users
+// GET /api/admin/users — admin only
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
   try {
     const users = await query(
@@ -295,7 +284,6 @@ const wss = new WebSocket.Server({ server, path: '/ws/admin/terminal' });
 const ALLOWED_TERMINAL_IPS = (process.env.TERMINAL_ALLOWED_IPS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 
-// Safe built-in commands (no shell execution of arbitrary commands)
 const TERMINAL_COMMANDS = {
   help: async () => [
     '// LinsaFTW Blog Backend Terminal',
@@ -306,7 +294,6 @@ const TERMINAL_COMMANDS = {
     '  clear          - Clear terminal',
     '  help           - Show this help',
     '  block <ip>     - Manually block an IP',
-    '  unblock <ip>   - Unblock an IP',
   ].join('\n'),
 
   status: async () => {
@@ -337,7 +324,6 @@ const TERMINAL_COMMANDS = {
 };
 
 wss.on('connection', async (ws, req) => {
-  // Auth check — parse cookie
   const cookieHeader = req.headers['cookie'] || '';
   const cookies = {};
   cookieHeader.split(';').forEach(pair => {
@@ -381,10 +367,7 @@ wss.on('connection', async (ws, req) => {
 
     if (!cmdName) return;
 
-    if (cmdName === 'clear') {
-      ws.send('\x1Bc');
-      return;
-    }
+    if (cmdName === 'clear') { ws.send('\x1Bc'); return; }
 
     if (TERMINAL_COMMANDS[cmdName]) {
       try {
@@ -396,7 +379,6 @@ wss.on('connection', async (ws, req) => {
       return;
     }
 
-    // block / unblock helpers
     if (cmdName === 'block') {
       const ip = args[0];
       if (!ip) { ws.send('Usage: block <ip>'); return; }
@@ -419,14 +401,14 @@ server.listen(PORT, () => {
   console.log(`
   ╔══════════════════════════════════════╗
   ║  LinsaFTW Blog Backend               ║
-  ║  Running on port ${PORT}               ║
+  ║  Running on port ${PORT}              ║
   ╚══════════════════════════════════════╝
   `);
   console.log(`API:      http://localhost:${PORT}/api`);
   console.log(`Terminal: ws://localhost:${PORT}/ws/admin/terminal`);
 });
 
-// ===== ADMIN CONSOLE (local terminal via stdin) =====
+// ===== STDIN CONSOLE =====
 if (process.stdin.isTTY) {
   const readline = require('readline');
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'blog> ' });
@@ -435,11 +417,7 @@ if (process.stdin.isTTY) {
     const cmd = line.trim();
     const [name, ...args] = cmd.split(/\s+/);
     if (TERMINAL_COMMANDS[name]) {
-      try {
-        console.log(await TERMINAL_COMMANDS[name](args));
-      } catch (e) {
-        console.error('Error:', e.message);
-      }
+      try { console.log(await TERMINAL_COMMANDS[name](args)); } catch (e) { console.error('Error:', e.message); }
     } else if (name === 'exit' || name === 'quit') {
       process.exit(0);
     } else if (name) {
